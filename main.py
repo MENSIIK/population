@@ -30,10 +30,12 @@ st.markdown(
 )
 
 # GitHub에 있는 ZIP 압축 CSV 주소입니다.
+
 DATA_URL = (
     "https://raw.githubusercontent.com/MENSIIK/population/main/"
-    "population_ts_yearly_gender(1).zip"
+    "population_ts_yearly_gender%20%281%29.zip"
 )
+
 
 # 0~99세와 100세 이상까지 총 101개 연령 구간입니다.
 AGE_LABELS = [f"{age}세" for age in range(100)] + ["100세 이상"]

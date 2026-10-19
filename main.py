@@ -1,4 +1,5 @@
 import json
+import re
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -8,127 +9,173 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-st.set_page_config(
-    page_title="전국 고령화 단계구분도",
-    page_icon="🗺️",
-    layout="wide",
-)
+st.set_page_config(page_title="전국 고령화 단계구분도", page_icon="🗺️", layout="wide")
 
-# 제공된 주소는 현재 404를 반환할 수 있으므로, 아래 우선순위로 데이터를 읽습니다.
-# 1) 앱 화면에서 업로드한 파일  2) main.py와 같은 폴더의 파일  3) 원격 URL
-POPULATION_URL = (
-    "https://raw.githubusercontent.com/MENSIIK/contents/main/"
-    "population_ts_yearly_gender%20%281%29.zip"
-)
-GEOJSON_URL = "https://raw.githubusercontent.com/MENSIIK/contents/main/sigungu_kr.geojson"
+# 기존 MENSIIK/contents 주소는 저장소 자체가 404이므로, 현재 접근 가능한 공개 자료원을 사용합니다.
+POPULATION_URL = "https://raw.githubusercontent.com/rainymon/2026-pop/main/202606_202606.csv"
+GEOJSON_URL = "https://raw.githubusercontent.com/KnellBalm/kr-admin-geojson/main/sig.geojson"
 BASE_DIR = Path(__file__).resolve().parent
-LOCAL_POPULATION = BASE_DIR / "population_ts_yearly_gender(1).zip"
-LOCAL_GEOJSON = BASE_DIR / "sigungu_kr.geojson"
 
 
-def fetch_url(url: str, label: str) -> bytes:
+def download_bytes(url: str, label: str) -> bytes:
     try:
         response = requests.get(url, timeout=120)
-    except requests.RequestException as exc:
-        raise RuntimeError(f"{label} URL에 연결하지 못했습니다: {exc}") from exc
-
-    if response.status_code == 404:
-        raise RuntimeError(
-            f"{label} URL이 404(Not Found)를 반환했습니다.\n\n"
-            f"주소: {url}\n\n"
-            "파일이 삭제/이동되었거나 저장소·브랜치·파일명이 잘못되었을 수 있습니다. "
-            "아래에서 파일을 업로드하거나, 파일을 GitHub 저장소에 함께 올려 주세요."
-        )
-    try:
         response.raise_for_status()
+        return response.content
     except requests.RequestException as exc:
-        raise RuntimeError(f"{label} 다운로드에 실패했습니다: {exc}") from exc
-    return response.content
+        raise RuntimeError(f"{label} 다운로드에 실패했습니다.\n주소: {url}\n원인: {exc}") from exc
 
 
-def get_file_bytes(uploaded_file, local_path: Path, url: str, label: str) -> bytes:
-    if uploaded_file is not None:
-        return uploaded_file.getvalue()
-    if local_path.exists():
-        return local_path.read_bytes()
-    return fetch_url(url, label)
+def read_csv_bytes(raw: bytes) -> pd.DataFrame:
+    """CSV는 UTF-8 계열을 먼저 시도하고, 실패하면 행정안전부 CSV에서 흔한 CP949를 시도합니다."""
+    errors = []
+    for encoding in ("utf-8-sig", "cp949", "euc-kr"):
+        try:
+            header = pd.read_csv(BytesIO(raw), nrows=0, encoding=encoding)
+            dtype = {"코드": str} if "코드" in header.columns else None
+            return pd.read_csv(
+                BytesIO(raw),
+                encoding=encoding,
+                dtype=dtype,
+                low_memory=False,
+            )
+        except (UnicodeDecodeError, pd.errors.ParserError, LookupError) as exc:
+            errors.append(f"{encoding}: {exc}")
+    raise ValueError("CSV 파일을 읽을 수 없습니다. 인코딩 또는 파일 형식을 확인해 주세요. " + " | ".join(errors))
 
 
-@st.cache_data(show_spinner=False)
-def parse_population(zip_bytes: bytes) -> pd.DataFrame:
-    try:
-        with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
+def read_population_table(raw: bytes) -> pd.DataFrame:
+    """ZIP 안의 CSV와 일반 CSV를 모두 지원합니다."""
+    if zipfile.is_zipfile(BytesIO(raw)):
+        with zipfile.ZipFile(BytesIO(raw)) as zf:
             csv_files = [
                 name for name in zf.namelist()
                 if name.lower().endswith(".csv") and not name.startswith("__MACOSX/")
             ]
             if not csv_files:
-                raise ValueError("ZIP 파일 안에서 CSV 파일을 찾지 못했습니다.")
-            csv_bytes = zf.read(csv_files[0])
-    except zipfile.BadZipFile as exc:
-        raise ValueError("인구 데이터가 올바른 ZIP 파일이 아닙니다.") from exc
+                raise ValueError("압축 파일 내부에서 CSV 파일을 찾지 못했습니다.")
+            raw = zf.read(csv_files[0])
+    return read_csv_bytes(raw)
 
-    # UTF-8 파일을 먼저 시도하고, 실패하면 한글 CSV에서 흔한 CP949를 시도합니다.
-    try:
-        df = pd.read_csv(BytesIO(csv_bytes), dtype={"코드": str}, encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        df = pd.read_csv(BytesIO(csv_bytes), dtype={"코드": str}, encoding="cp949")
 
-    required = {"연도", "코드"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"인구 CSV에 필요한 열이 없습니다: {', '.join(sorted(missing))}")
+def get_age(col_name: str):
+    """계_0세, 계_65세, 계_100세 이상, 2026년06월_계_0세 형식을 인식합니다."""
+    name = str(col_name).strip()
+    match = re.search(r"(?:^|_)계_(\d+)\s*세\s*$", name)
+    if match:
+        return int(match.group(1))
+    if re.search(r"(?:^|_)계_100\s*세\s*이상\s*$", name):
+        return 100
+    return None
 
-    df["연도"] = pd.to_numeric(df["연도"], errors="coerce")
-    df = df.loc[df["연도"] == 2026].copy()
-    if df.empty:
-        raise ValueError("인구 데이터에서 2026년 자료를 찾지 못했습니다.")
 
-    df["코드"] = df["코드"].astype("string").str.strip()
-    df["시군구코드"] = df["코드"].str[:5].str.zfill(5)
+def choose_age_columns(columns):
+    age_columns = [(col, get_age(col)) for col in columns]
+    age_columns = [(col, age) for col, age in age_columns if age is not None]
+    if not age_columns:
+        raise ValueError("연령별 전체 인구 열(계_0세, 계_1세 등)을 찾지 못했습니다.")
 
-    # 남_ / 여_ 열은 계산에서 제외하고, 계_ 열만 이용합니다.
-    total_cols = [col for col in df.columns if col.startswith("계_")]
-    elderly_cols = []
-    for col in total_cols:
-        age = col.removeprefix("계_").strip()
-        if age == "100세 이상":
-            elderly_cols.append(col)
-        elif age.endswith("세") and age[:-1].isdigit() and int(age[:-1]) >= 65:
-            elderly_cols.append(col)
+    # 대체 CSV는 열 이름에 '2026년06월_' 접두사가 있습니다. 2026년 6월 열만 선택합니다.
+    dated = []
+    for col, age in age_columns:
+        match = re.match(r"^(\d{4})년\s*(\d{1,2})월", str(col).strip())
+        if match:
+            dated.append((col, age, int(match.group(1)), int(match.group(2))))
+    if dated:
+        june_2026 = [(col, age) for col, age, year, month in dated if year == 2026 and month == 6]
+        if june_2026:
+            return june_2026
+        year_2026 = [(col, age) for col, age, year, _ in dated if year == 2026]
+        if year_2026:
+            return year_2026
+        raise ValueError("CSV의 연령 열에서 2026년 자료를 찾지 못했습니다.")
+    return age_columns
 
-    if not total_cols:
-        raise ValueError("'계_'로 시작하는 전체 인구 열을 찾지 못했습니다.")
+
+def normalise_code(value) -> str:
+    if pd.isna(value):
+        return ""
+    code = str(value).strip()
+    if code.endswith(".0"):
+        code = code[:-2]
+    digits = re.sub(r"\D", "", code)
+    return digits
+
+
+@st.cache_data(show_spinner=False)
+def calculate_population(raw: bytes) -> pd.DataFrame:
+    df = read_population_table(raw)
+
+    # 이전 형식은 연도 열에 2015~2026년이 있으므로 2026년 행만 사용합니다.
+    if "연도" in df.columns:
+        years = pd.to_numeric(df["연도"], errors="coerce")
+        df = df.loc[years == 2026].copy()
+        if df.empty:
+            raise ValueError("인구 데이터에서 2026년 자료를 찾지 못했습니다.")
+
+    age_column_pairs = choose_age_columns(df.columns)
+    age_cols = [col for col, _ in age_column_pairs]
+    elderly_cols = [col for col, age in age_column_pairs if age >= 65]
     if not elderly_cols:
-        raise ValueError("'계_65세'부터 '계_100세 이상'까지의 열을 찾지 못했습니다.")
+        raise ValueError("65세 이상부터 100세 이상까지의 인구 열이 없습니다.")
 
-    for col in total_cols:
+    # 원래 형식은 '코드' 열, 대체 주민등록 CSV는 행정구역 문자열 끝의 10자리 코드를 사용합니다.
+    if "코드" in df.columns:
+        codes = df["코드"].map(normalise_code)
+        # 시도·시군구·동·코드 구조는 이미 읍면동 행만 담고 있으므로 모든 행을 사용합니다.
+        structured_dong_table = {"시도", "시군구", "동"}.issubset(df.columns)
+    elif "행정구역" in df.columns:
+        codes = df["행정구역"].astype(str).str.extract(r"(\d{5,10})\s*\)?\s*$", expand=False).fillna("")
+        codes = codes.map(normalise_code)
+        structured_dong_table = False
+    else:
+        raise ValueError("CSV에 '코드' 열 또는 '행정구역' 열이 없습니다.")
+
+    df["__code"] = codes
+    df["__code"] = df["__code"].astype(str).str.strip()
+    df = df.loc[df["__code"].str.len().ge(5)].copy()
+
+    # 통합 주민등록 CSV에는 시도·시군구·읍면동 행이 함께 들어 있습니다.
+    # 10자리 코드의 뒤 5자리가 00000이면 시군구 합계 행이므로 제외합니다.
+    if not structured_dong_table:
+        ten_digit = df["__code"].str.len().eq(10)
+        dong_rows = ten_digit & df["__code"].str[5:].ne("00000")
+        df = df.loc[dong_rows].copy()
+        if df.empty:
+            raise ValueError("CSV에서 읍·면·동 단위 10자리 행정구역 코드를 찾지 못했습니다.")
+
+    for col in age_cols:
         df[col] = pd.to_numeric(
             df[col].astype(str).str.replace(",", "", regex=False),
             errors="coerce",
         ).fillna(0)
 
-    df["전체인구"] = df[total_cols].sum(axis=1)
-    df["65세이상인구"] = df[elderly_cols].sum(axis=1)
+    # 나이별 '계_' 열만 합산합니다. 남성·여성 열과 별도의 총인구 열은 중복 합산하지 않습니다.
+    df["전체인구"] = df[age_cols].sum(axis=1)
+    df["고령인구"] = df[elderly_cols].sum(axis=1)
+    df["시군구코드"] = df["__code"].str[:5].str.zfill(5)
 
     result = (
         df.groupby("시군구코드", as_index=False)
-        .agg(전체인구=("전체인구", "sum"), 고령인구=("65세이상인구", "sum"))
+        .agg(전체인구=("전체인구", "sum"), 고령인구=("고령인구", "sum"))
     )
     result["고령화율"] = (
         result["고령인구"]
         .div(result["전체인구"].where(result["전체인구"] > 0))
         .mul(100)
     )
+    result = result.dropna(subset=["고령화율"])
+    if result.empty:
+        raise ValueError("시군구별 고령화율을 계산할 수 있는 행이 없습니다.")
     return result
 
 
 @st.cache_data(show_spinner=False)
-def parse_geojson(geojson_bytes: bytes) -> dict:
+def normalise_geojson(raw: bytes) -> dict:
     try:
-        geojson = json.loads(geojson_bytes.decode("utf-8-sig"))
+        geojson = json.loads(raw.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("시군구 경계 파일이 올바른 JSON/GeoJSON 형식이 아닙니다.") from exc
+        raise ValueError("시군구 경계 파일이 올바른 GeoJSON이 아닙니다.") from exc
 
     features = geojson.get("features")
     if not isinstance(features, list):
@@ -136,71 +183,75 @@ def parse_geojson(geojson_bytes: bytes) -> dict:
 
     for feature in features:
         props = feature.setdefault("properties", {})
-        if props.get("코드") is not None:
-            props["코드"] = str(props["코드"]).strip().zfill(5)
+        # 대체 GeoJSON의 속성명(SIG_CD, SIG_KOR_NM, SIDO_NM)을 표준 속성으로 맞춥니다.
+        code = props.get("코드", props.get("SIG_CD"))
+        if code is not None:
+            props["코드"] = normalise_code(code).zfill(5)
+        if not props.get("시군구"):
+            props["시군구"] = props.get("SIG_KOR_NM", props.get("FULL_NM", "이름 없음"))
+        if not props.get("시도"):
+            props["시도"] = props.get("SIDO_NM", "")
     return geojson
 
 
 st.title("전국 고령화 단계구분도")
-st.caption("2026년 자료 · 시군구별 65세 이상 인구 비율")
+st.caption("2026년 6월 기준 · 시군구별 65세 이상 인구 비율")
 
 with st.sidebar:
-    st.header("데이터 파일")
-    st.caption(
-        "원본 다운로드 주소에서 404 오류가 발생하면 두 파일을 여기서 업로드하세요. "
-        "또는 두 파일을 GitHub 저장소에서 main.py와 같은 폴더에 올려도 됩니다."
-    )
-    population_upload = st.file_uploader(
-        "인구 데이터 ZIP", type=["zip"], key="population_zip"
-    )
-    geojson_upload = st.file_uploader(
-        "시군구 경계 GeoJSON", type=["geojson", "json"], key="geojson_file"
-    )
+    st.header("직접 파일 업로드(선택)")
+    st.caption("자동 다운로드가 실패할 때만 파일을 직접 넣으면 됩니다.")
+    population_upload = st.file_uploader("인구 데이터 ZIP 또는 CSV", type=["zip", "csv"])
+    geojson_upload = st.file_uploader("시군구 경계 GeoJSON", type=["geojson", "json"])
 
 try:
-    with st.spinner("인구 데이터를 불러오는 중..."):
-        population_bytes = get_file_bytes(
-            population_upload, LOCAL_POPULATION, POPULATION_URL, "인구 데이터"
-        )
-        population = parse_population(population_bytes)
+    with st.spinner("2026년 인구 데이터를 불러오는 중..."):
+        if population_upload is not None:
+            population_bytes = population_upload.getvalue()
+        else:
+            local_candidates = [
+                BASE_DIR / "population_ts_yearly_gender(1).zip",
+                BASE_DIR / "202606_202606.csv",
+                BASE_DIR / "202606_202606_연령별인구현황_월간.csv",
+            ]
+            local_file = next((p for p in local_candidates if p.is_file()), None)
+            population_bytes = local_file.read_bytes() if local_file else download_bytes(POPULATION_URL, "인구 데이터")
+        population = calculate_population(population_bytes)
 
     with st.spinner("시군구 경계 데이터를 불러오는 중..."):
-        geojson_bytes = get_file_bytes(
-            geojson_upload, LOCAL_GEOJSON, GEOJSON_URL, "시군구 경계 데이터"
-        )
-        geojson = parse_geojson(geojson_bytes)
+        if geojson_upload is not None:
+            geojson_bytes = geojson_upload.getvalue()
+        else:
+            local_geojsons = [BASE_DIR / "sigungu_kr.geojson", BASE_DIR / "sig.geojson"]
+            local_geojson = next((p for p in local_geojsons if p.is_file()), None)
+            geojson_bytes = local_geojson.read_bytes() if local_geojson else download_bytes(GEOJSON_URL, "시군구 경계")
+        geojson = normalise_geojson(geojson_bytes)
 
-    boundary_codes = {
-        feature["properties"]["코드"]
-        for feature in geojson["features"]
-        if feature.get("properties", {}).get("코드") is not None
-    }
-    population["시군구코드"] = population["시군구코드"].astype("string").str.zfill(5)
+    name_by_code = {}
+    boundary_codes = set()
+    for feature in geojson["features"]:
+        props = feature.get("properties", {})
+        code = props.get("코드")
+        if code:
+            boundary_codes.add(code)
+            name_by_code[code] = props.get("시군구", "이름 없음")
+
     map_df = population[population["시군구코드"].isin(boundary_codes)].copy()
-
-    name_by_code = {
-        feature["properties"]["코드"]: feature["properties"].get("시군구", "이름 없음")
-        for feature in geojson["features"]
-        if feature.get("properties", {}).get("코드") is not None
-    }
     map_df["시군구"] = map_df["시군구코드"].map(name_by_code)
-    map_df = map_df.dropna(subset=["고령화율"])
-
     if map_df.empty:
         st.error(
-            "인구 데이터와 경계 데이터의 코드가 일치하지 않습니다. "
-            "두 파일의 '코드' 형식 및 기준 연도를 확인해 주세요."
+            "인구 데이터와 시군구 경계 코드가 하나도 일치하지 않습니다. "
+            "인구 CSV의 행정구역 코드가 10자리인지 확인해 주세요."
         )
         st.stop()
 
-    total_population = map_df["전체인구"].sum()
-    total_elderly = map_df["고령인구"].sum()
-    national_rate = total_elderly / total_population * 100 if total_population > 0 else 0
+    national_population = map_df["전체인구"].sum()
+    national_elderly = map_df["고령인구"].sum()
+    national_rate = national_elderly / national_population * 100 if national_population else 0
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("지도에 표시된 시군구", f"{len(map_df):,}개")
-    c2.metric("전체 인구", f"{total_population:,.0f}명")
-    c3.metric("65세 이상 비율", f"{national_rate:.2f}%")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("지도에 표시된 시군구", f"{len(map_df):,}개")
+    m2.metric("전체 인구", f"{national_population:,.0f}명")
+    m3.metric("65세 이상 비율", f"{national_rate:.2f}%")
 
     fig = px.choropleth(
         map_df,
@@ -229,11 +280,7 @@ try:
         marker_line_width=0.35,
         hovertemplate="<b>%{hovertext}</b><br>고령화율: %{z:.2f}%<extra></extra>",
     )
-    fig.update_layout(
-        height=800,
-        margin=dict(l=0, r=0, t=55, b=0),
-        coloraxis_colorbar=dict(title="고령화율 (%)"),
-    )
+    fig.update_layout(height=800, margin=dict(l=0, r=0, t=55, b=0), coloraxis_colorbar=dict(title="고령화율 (%)"))
     st.plotly_chart(fig, use_container_width=True)
 
     with st.expander("시군구별 수치 확인"):
@@ -255,9 +302,13 @@ try:
         )
 
     st.caption(
-        "전국 비율은 지도에 표시된 시군구의 인구를 합산해 계산합니다. "
-        "경계 코드와 일치하지 않는 지역은 지도에서 제외됩니다."
+        "인구 자료: 2026년 6월 주민등록 연령별 인구 CSV. "
+        "경계 자료의 코드와 일치하는 시군구만 지도에 표시합니다."
     )
 
 except Exception as exc:
-    st.error(str(exc))
+    st.error(f"데이터를 불러오거나 지도를 생성하지 못했습니다: {exc}")
+    st.info(
+        "자동 다운로드에 실패한 경우, 사이드바에서 2026년 인구 ZIP/CSV와 "
+        "시군구 경계 GeoJSON을 업로드하거나 두 파일을 main.py와 같은 GitHub 폴더에 넣어 주세요."
+    )

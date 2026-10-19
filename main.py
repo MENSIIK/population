@@ -18,7 +18,7 @@ st.set_page_config(
 # 1) 앱 화면에서 업로드한 파일  2) main.py와 같은 폴더의 파일  3) 원격 URL
 POPULATION_URL = (
     "https://raw.githubusercontent.com/MENSIIK/contents/main/"
-    "population_ts_yearly_gender%281%29.zip"
+    "population_ts_yearly_gender%20%281%29.zip"
 )
 GEOJSON_URL = "https://raw.githubusercontent.com/MENSIIK/contents/main/sigungu_kr.geojson"
 BASE_DIR = Path(__file__).resolve().parent
